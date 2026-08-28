@@ -110,6 +110,37 @@ to disk after that, so it's a one-off cost.
 
 ---
 
+## 6. The frontend (Streamlit app)
+
+`app.py` is a browser UI over the exact same pipeline `eval/run_pipeline.py`
+runs from the CLI: retrieve → Verifier #1 (sufficiency gate) → answer →
+Verifier #2 (citation check).
+
+```powershell
+pip install -r requirements.txt        # now includes streamlit + watchdog
+$env:GROQ_API_KEY = 'gsk_...'           # same key the CLI uses
+streamlit run app.py
+```
+
+It opens at http://localhost:8501.
+
+Notes:
+
+- **It needs the data pack** (`data/filings/*.htm`, `data/practice-questions.jsonl`)
+  and an LLM key (`GROQ_API_KEY`, or `GEMINI_API_KEY`) in the shell you launch
+  `streamlit` from — set them *before* `streamlit run`, not in the browser.
+- **First query is slow.** Loading a filing triggers the MiniLM embedding
+  download + that filing's embeddings, plus the ~90 MB cross-encoder reranker.
+  Everything caches to `.cache/` afterwards; later questions are fast.
+- **Launch from the activated venv.** If `where streamlit` (PowerShell) points
+  outside `.venv\Scripts\`, it's the wrong interpreter and imports like
+  `sentence-transformers` will fail — `.\.venv\Scripts\Activate.ps1` first.
+- **Adding filings from the UI:** the sidebar has an uploader that accepts SEC
+  filings as inline-XBRL `.htm` (as downloaded from EDGAR). It writes to
+  `data/filings/` and parses on the spot; PDFs and plain HTML won't parse.
+
+---
+
 ## Note on my sandbox vs your machine
 
 I can read and write files in this folder, but I run Python in a separate Linux
