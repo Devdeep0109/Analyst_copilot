@@ -1,0 +1,49 @@
+# ---------------------------------------------------------------- secrets --
+# API keys live in environment variables, never in files. These patterns exist
+# so an accidental .env can never be committed.
+.env
+.env.*
+*.key
+secrets.json
+credentials.json
+
+# ------------------------------------------------------------------- data --
+# 336 MB of SEC filings from the provided data pack. Not ours to redistribute,
+# and too large for git. See README for how to restore it.
+data/filings/
+data/*.jsonl
+data/
+
+# ------------------------------------------------------------------ cache --
+# Everything here is REGENERATED from data/ + the models. Nothing unique lives
+# in it, and it is ~120 MB.
+#   chunks/     parsed + chunked filings      (rebuild: seconds per filing)
+#   embeddings/ MiniLM vectors, 70 MB         (rebuild: ~30s per filing)
+#   rerank/     cross-encoder pair scores     (rebuild: slow but free, local)
+#   verdicts/   Verifier #1 LLM judgements    (rebuild: costs API quota)
+#   answers/    answering LLM outputs         (rebuild: costs API quota)
+.cache/
+
+# ------------------------------------------------------------ environment --
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# --------------------------------------------------------------- editors ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ----------------------------------------------------------------- models --
+# Hugging Face caches these in ~/.cache/huggingface, but guard against a local
+# copy being dragged in.
+*.safetensors
+*.bin
+*.pt
+*.onnx

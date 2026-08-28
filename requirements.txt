@@ -1,0 +1,29 @@
+# The Analyst Copilot -- Python dependencies
+#
+# Install into a virtualenv (see SETUP.md). Everything here comes from PyPI
+# (pypi.org), the standard Python package index -- `pip install` is the only
+# download step. The embedding MODEL itself is a separate download that
+# sentence-transformers fetches automatically from Hugging Face on first use.
+
+# --- already in use (Day 1-2) ---
+beautifulsoup4>=4.12          # HTML parsing of the filings
+numpy>=1.26
+
+# OPTIONAL. lxml is ~1.3x faster than the stdlib html.parser, but it is not
+# required -- page_parser.py detects it and falls back automatically. Verified
+# equivalent across 389 pages (identical page counts; the only difference was
+# EDGAR wrapper noise on page 1 that html.parser correctly drops).
+# If `pip install lxml` fails on your platform, just skip it.
+# lxml>=5.0
+
+# --- Day 3: retrieval ladder ---
+rank-bm25>=0.2.2              # BM25Okapi -- lexical retrieval, pure Python, tiny
+
+# Dense retrieval. sentence-transformers pulls in torch, which is the only
+# large download here. On Windows CPU install torch FIRST from the CPU-only
+# index (see SETUP.md) or pip will fetch the ~2.5 GB CUDA build you don't need.
+sentence-transformers>=3.0
+
+# --- Day 4: reranking (install when you get there, not before) ---
+# The cross-encoder reranker uses the same sentence-transformers package,
+# so there is nothing extra to install for it.
