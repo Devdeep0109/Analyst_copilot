@@ -234,8 +234,92 @@ def parse_filing(html_path: str, doc_name: str | None = None) -> ParsedFiling:
         pages.append(Page(page_num=page_num, text=_join_parts(buf_parts), tables=seg_tables))
 
     has_page_breaks = raw_break_count > 0
+
+    if has_page_breaks:
+        _calibrate_page_nums(pages)
+
     return ParsedFiling(doc_name=doc_name, pages=pages,
                          has_page_breaks=has_page_breaks, raw_break_count=raw_break_count)
+
+
+# ------------- TOC-based page-number calibration ----------------------------
+
+# Each tuple: (regex matching "Section Title  NN" in the TOC, substring to
+# search for in the body page).  These section titles appear in virtually every
+# SEC 10-K/10-Q and are distinctive enough to land on only one body page.
+_TOC_ANCHORS = [
+    (re.compile(r"Legal Proceedings\s+(\d+)"),
+     "Legal Proceedings"),
+    (re.compile(r"Risk Factors\s+(\d+)"),
+     "Risk Factors"),
+    (re.compile(r"Controls and Procedures\s+(\d+)"),
+     "Controls and Procedures"),
+    (re.compile(r"Unregistered Sales\s+(\d+)"),
+     "Unregistered Sales"),
+    (re.compile(r"Mine Safety Disclosures\s+(\d+)"),
+     "Mine Safety Disclosures"),
+    (re.compile(r"Quantitative and Qualitative Disclosures\s+(\d+)"),
+     "Quantitative and Qualitative Disclosures"),
+    (re.compile(r"Unresolved Staff Comments\s+(\d+)"),
+     "Unresolved Staff Comments"),
+    (re.compile(r"Properties\s+(\d+)"),
+     "Properties"),
+]
+
+
+def _calibrate_page_nums(pages: list[Page]) -> None:
+    """Detect the offset between raw parser page numbers and the filing's own
+    numbering (as printed in its Table of Contents), and shift all page numbers
+    so they match the filing's convention.
+
+    Strategy: find the TOC page(s), extract section→page mappings using known
+    anchor patterns, locate those same sections in the body, and compute the
+    dominant offset.
+    """
+    if len(pages) < 4:
+        return  # too few pages to calibrate
+
+    # 1. Find TOC page(s) — always in the first ~8 pages.
+    toc_text = ""
+    toc_page_nums: set[int] = set()
+    for p in pages[:8]:
+        if "TABLE OF CONTENTS" in p.text.upper():
+            toc_text += " " + p.text
+            toc_page_nums.add(p.page_num)
+
+    if not toc_text:
+        return  # no TOC found — cannot calibrate
+
+    # 2. Cross-reference: for each TOC anchor, find the stated page, then
+    #    locate that section title in body pages and record the offset.
+    offsets: list[int] = []
+    for pat, label in _TOC_ANCHORS:
+        m = pat.search(toc_text)
+        if not m:
+            continue
+        toc_stated_page = int(m.group(1))
+        label_lower = label.lower()
+        for p in pages:
+            if p.page_num in toc_page_nums:
+                continue  # skip the TOC page itself
+            # Check near top of page (first 600 chars) case-insensitively
+            if label_lower in p.text[:600].lower():
+                offsets.append(p.page_num - toc_stated_page)
+                break
+
+    if not offsets:
+        return
+
+    # 3. Take the dominant offset.
+    from collections import Counter
+    dominant_offset = Counter(offsets).most_common(1)[0][0]
+
+    if dominant_offset == 0:
+        return  # already aligned
+
+    # 4. Shift every page number.
+    for p in pages:
+        p.page_num = max(1, p.page_num - dominant_offset)
 
 
 def _join_parts(parts: list[str]) -> str:
