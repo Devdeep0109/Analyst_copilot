@@ -169,6 +169,38 @@ def _normalize_text(s: str) -> str:
 PROSE_WORD_THRESHOLD = 12
 
 
+# "THIS METRIC DOES NOT APPLY" IS AN ANSWER, NOT A REFUSAL.
+#
+# Several questions invite it explicitly: "Does AMEX have an improving
+# operating margin profile? If operating margin is not a useful metric for a
+# company like this, state that and explain why." For those, gold is:
+#
+#     "Performance is not measured through operating margin"
+#
+# and the model said:
+#
+#     "No, operating margin is not a useful metric for American Express
+#      as of 2022 because ..."
+#
+# The same answer, worded differently -- and scored CONFIDENTLY WRONG (-1),
+# because gold carried no number and the strings did not overlap enough. Two
+# points lost per case for being right.
+_NOT_APPLICABLE = re.compile(
+    r"(not|isn'?t|is\s+not)\s+(a\s+)?(useful|relevant|meaningful|applicable|"
+    r"appropriate|suitable)\b"
+    r"|not\s+measured\s+through\b"
+    r"|does\s+not\s+(use|report|measure|apply)\b"
+    r"|\bnot\s+applicable\b|\bn/?a\b"
+    r"|no(t|n)?[- ]?meaningful\b",
+    re.I,
+)
+
+
+def _both_say_not_applicable(predicted: str, gold: str) -> bool:
+    return bool(_NOT_APPLICABLE.search(predicted or "")
+                and _NOT_APPLICABLE.search(gold or ""))
+
+
 def answers_match(predicted: str, gold: str) -> bool | None:
     """True / False / None.
 
@@ -184,6 +216,12 @@ def answers_match(predicted: str, gold: str) -> bool | None:
     """
     if not predicted:
         return False
+
+    # Checked BEFORE the prose-length deferral: both sides saying "this metric
+    # does not apply here" is a match regardless of how verbosely either says
+    # it, and deferring it to an LLM judge would leave the point unscored.
+    if _both_say_not_applicable(predicted, gold):
+        return True
 
     # Prose gold -> defer, regardless of whether it contains numbers.
     if len(_normalize_text(gold).split()) > PROSE_WORD_THRESHOLD:
@@ -225,6 +263,27 @@ def answers_match(predicted: str, gold: str) -> bool | None:
         if g in p or p in g:
             return True
         return _synonym_match(gold, predicted)
+
+    # SHORT NAMED ANSWER inside a longer gold sentence.
+    #
+    # The question "which segment dragged down growth?" wants a segment name.
+    # The model said "Consumer"; gold says "The consumer segment shrunk by 0.9%
+    # organically". That is the SAME ANSWER -- but gold carries a number (0.9)
+    # and the prediction does not, so the numeric path scored it CONFIDENTLY
+    # WRONG at -1 when it deserved +1. A 2-point swing on a right answer.
+    #
+    # Guarded so it cannot wave through vagueness: the prediction must be short
+    # (<= 4 words), must survive stopword removal, and every remaining word must
+    # appear in gold. "Consumer" passes; "revenue" against a gold about
+    # segments does not.
+    if not pred_nums:
+        p_words = [w for w in _normalize_text(predicted).split()
+                   if w not in {"the", "a", "an", "of", "in", "is", "was",
+                                "segment", "and", "to", "for"}]
+        if 1 <= len(p_words) <= 4:
+            g_norm = _normalize_text(gold)
+            if all(w in g_norm for w in p_words):
+                return True
 
     # Gold is numeric but the prediction states no number at all. If the gold
     # is a bare verdict the polarity check above already settled it; otherwise

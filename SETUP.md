@@ -141,9 +141,24 @@ Notes:
 
 ---
 
-## Note on my sandbox vs your machine
+## Troubleshooting
 
-I can read and write files in this folder, but I run Python in a separate Linux
-sandbox with no PyPI access — so I can't install these packages or download
-models myself. BM25 and dense retrieval get **written** here by me and **run**
-by you. Paste the output back and we'll compare the ladder honestly.
+**`GROQ_API_KEY is not set`** — set it in the shell you are running from, not a
+different one. `[Environment]::SetEnvironmentVariable(...,'User')` only affects
+terminals opened afterwards.
+
+**`HTTP 403: error code 1010`** — Cloudflare rejecting the client, not a bad key.
+The HTTP client sends a proper User-Agent to avoid this; if you see it, check you
+are on the current `pipeline/llm.py`.
+
+**`Groq quota exhausted -- wait NNNNs`** — the daily token cap, not per-minute
+throttling. Everything is cached, so re-running after the reset resumes where it
+stopped rather than starting over.
+
+**Rate-limited mid-run** — raise `--rate` (seconds between calls). Counter-
+intuitively this is *faster* than being throttled, because a 429 costs a full
+retry ladder and still fails.
+
+**`sentence-transformers` import errors** — you are on the wrong interpreter.
+Activate the venv first; check with `where streamlit` (PowerShell) or
+`which streamlit`.
