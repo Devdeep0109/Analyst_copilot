@@ -82,9 +82,33 @@ class ParsedTable:
 
 @dataclass
 class Page:
-    page_num: int          # 1-indexed, in OUR parser's counting
+    """TWO page numbers, because two different consumers need two conventions.
+
+    page_num      sequential position in the document, 1-indexed. This is the
+                  PDF sheet number, and it is what FinanceBench's
+                  `evidence_page_num` refers to (0-based, hence the +1 in
+                  eval/gold.py). EVALUATION SCORES AGAINST THIS.
+
+    printed_page  the number actually printed at the foot of the page. A 10-K
+                  puts ~14 pages of cover and table of contents before printed
+                  page 1, so sheet 60 is commonly printed "46". THE UI SHOWS
+                  THIS, because it is what an analyst turns to.
+
+    Collapsing these into one field forces a choice between a correct product
+    and a correct score. Keeping both means calibration can improve what the
+    user sees without silently making every cited page count as "wrong
+    location" against the answer key.
+    """
+    page_num: int
     text: str               # plain text of the page (tables rendered as grids)
     tables: list[ParsedTable] = field(default_factory=list)
+    printed_page: int | None = None
+
+    @property
+    def display_page(self) -> int:
+        """What to show a human. Falls back to the sheet number when the
+        filing's own numbering could not be determined."""
+        return self.printed_page if self.printed_page is not None else self.page_num
 
     def contains(self, snippet: str) -> bool:
         return _normalize(snippet) in _normalize(self.text)
@@ -312,14 +336,46 @@ def _calibrate_page_nums(pages: list[Page]) -> None:
 
     # 3. Take the dominant offset.
     from collections import Counter
-    dominant_offset = Counter(offsets).most_common(1)[0][0]
+    counts = Counter(offsets)
+    dominant_offset, support = counts.most_common(1)[0]
+
+    # ---- SANITY CHECKS -------------------------------------------------
+    # Without these, one bad TOC match silently corrupts every page number in
+    # the filing. 3M_2023Q2_10Q produced a shift of +45 -- the anchor matched
+    # the wrong section, and every page the UI showed for that document was
+    # wrong. A calibration you cannot trust is worse than none, because it is
+    # invisible.
+
+    # (a) A NEGATIVE offset means the body page came BEFORE the page the TOC
+    #     says it is on. That is impossible in a real document; it means the
+    #     anchor matched a mention in the TOC region or a cross-reference.
+    if dominant_offset < 0:
+        return
+
+    # (b) Front matter is a cover page, a TOC, maybe a forward-looking
+    #     statement. More than 25 pages of it is not front matter, it is a
+    #     mismatch.
+    if dominant_offset > 25:
+        return
+
+    # (c) One anchor agreeing with itself is not evidence. Require either two
+    #     anchors agreeing, or a single anchor with no competing answer.
+    if support < 2 and len(counts) > 1:
+        return
 
     if dominant_offset == 0:
-        return  # already aligned
+        for p in pages:
+            p.printed_page = p.page_num
+        return
 
-    # 4. Shift every page number.
+    # 4. RECORD the printed number. Do NOT overwrite page_num -- that is the
+    #    sheet index the evaluation scores against.
     for p in pages:
-        p.page_num = max(1, p.page_num - dominant_offset)
+        printed = p.page_num - dominant_offset
+        # Front matter has no printed number (or uses roman numerals we do not
+        # parse). Leave it None so display_page falls back to the sheet number
+        # rather than showing a fabricated "1" for the first fifteen pages.
+        p.printed_page = printed if printed >= 1 else None
 
 
 def _join_parts(parts: list[str]) -> str:
