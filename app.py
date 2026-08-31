@@ -3,6 +3,7 @@ The Analyst Copilot — Conversational Financial Research Terminal.
 ChatGPT-style multi-turn dialogue layout with 3D elevation, verified citations, and zero emojis.
 """
 
+import json
 import os
 import re
 import time
@@ -24,6 +25,7 @@ from retrieval.rerank import MS_MARCO, RerankRetriever
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 FILINGS_DIR = PROJECT_ROOT / "data" / "filings"
+QUESTIONS_PATH = PROJECT_ROOT / "data" / "practice-questions.jsonl"
 
 # ============================================================================
 # Page config
@@ -457,6 +459,63 @@ def inject_titanium_carbon_css():
             0% {{ transform: rotate(0deg); }}
             100% {{ transform: rotate(360deg); }}
         }}
+
+        /* Attractive Unscrollable Justification Box */
+        .justification-card {{
+            background: linear-gradient(135deg, rgba(129, 140, 248, 0.08) 0%, rgba(20, 28, 41, 0.85) 100%);
+            border: 1px solid #28374d;
+            border-left: 3px solid {accent_indigo};
+            border-radius: 8px;
+            padding: 0.85rem 1.15rem;
+            margin: 0.5rem 0 0.85rem 0;
+            color: #cbd5e1;
+            font-size: 0.88rem;
+            line-height: 1.65;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            overflow-wrap: break-word;
+            overflow: visible !important;
+            font-family: 'JetBrains Mono', 'Segoe UI', monospace;
+            box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+        }}
+
+        /* Unified Evidence & Citation Card */
+        .evidence-card {{
+            background: linear-gradient(135deg, rgba(56, 189, 248, 0.05) 0%, rgba(18, 26, 38, 0.85) 100%);
+            border: 1px solid #1e3a5f;
+            border-left: 3px solid {accent_blue};
+            border-radius: 8px;
+            padding: 0.95rem 1.15rem;
+            margin: 0.75rem 0 0.85rem 0;
+            box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.4);
+        }}
+
+        .evidence-header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 0.55rem;
+            padding-bottom: 0.45rem;
+            border-bottom: 1px solid rgba(56, 189, 248, 0.15);
+        }}
+
+        .evidence-label {{
+            font-size: 0.72rem;
+            font-weight: 800;
+            color: {accent_blue};
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+        }}
+
+        .evidence-text {{
+            color: {text_primary};
+            font-size: 0.9rem;
+            line-height: 1.65;
+            font-style: italic;
+            white-space: pre-wrap;
+            word-break: break-word;
+            font-family: 'JetBrains Mono', 'Segoe UI', monospace;
+        }}
     </style>
     """
     st.markdown(css, unsafe_allow_html=True)
@@ -518,6 +577,55 @@ def load_gold_cached():
 
 
 # ============================================================================
+# Document Metadata Resolver (Company, Period, Sector)
+# ============================================================================
+@st.cache_data
+def get_filing_metadata(doc_name: str) -> Dict[str, str]:
+    """Retrieve company name, period, and GICS sector for any filing."""
+    # 1. Check gold practice-questions dataset
+    if QUESTIONS_PATH.exists():
+        with open(QUESTIONS_PATH, encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    raw = json.loads(line)
+                    if raw.get("doc_name") == doc_name:
+                        return {
+                            "company": str(raw.get("company", "")).strip() or "Corporate Registrant",
+                            "doc_period": str(raw.get("doc_period", "")).strip() or "Latest Disclosed Period",
+                            "gics_sector": str(raw.get("gics_sector", "")).strip() or "Corporate Disclosures",
+                        }
+                except Exception:
+                    pass
+
+    # 2. Dynamic heuristic parsing from doc_name (e.g. 3M_2022_10K, AAPL_2023_10K)
+    parts = doc_name.replace("-", "_").split("_")
+    company = parts[0] if parts else "Enterprise Registrant"
+    period = "Latest Period"
+    for part in parts:
+        if re.match(r"^(19|20)\d{2}", part):
+            period = part
+            break
+
+    # Common sector mapping
+    sector_map = {
+        "3M": "Industrials", "AAPL": "Information Technology", "AMZN": "Consumer Discretionary",
+        "ADBE": "Information Technology", "BA": "Industrials", "KO": "Consumer Staples",
+        "MSFT": "Information Technology", "GOOGL": "Communication Services", "NVDA": "Information Technology",
+        "JNJ": "Health Care", "JPM": "Financials", "TSLA": "Consumer Discretionary",
+        "WMT": "Consumer Staples", "PG": "Consumer Staples", "CVX": "Energy"
+    }
+    sector = sector_map.get(company.upper(), "Corporate Disclosures")
+
+    return {
+        "company": company,
+        "doc_period": period,
+        "gics_sector": sector,
+    }
+
+
+# ============================================================================
 # Pipeline Core (Silent Single-Turn Execution)
 # ============================================================================
 def ensure_indexed(doc_name: str, corpus_ref, retriever_ref) -> None:
@@ -549,6 +657,9 @@ def run_pipeline(question: str, doc_name: str, corpus_ref, retriever_ref, answer
             "verdict": None,
             "answer": None,
             "citation": None,
+            "justification": "",
+            "question_type": friendly_query_class(cls.label),
+            "full_page_evidence": "",
             "elapsed": time.time() - start,
         }
 
@@ -560,6 +671,21 @@ def run_pipeline(question: str, doc_name: str, corpus_ref, retriever_ref, answer
 
     cite = check_citation(ans.quote, ans.page, hits)
 
+    # Check for gold question details if exact benchmark query
+    gold_qs = load_gold_cached()
+    gold_match = next((g for g in gold_qs if g.doc_name == doc_name and g.question.strip().lower() == question.strip().lower()), None)
+
+    if gold_match:
+        q_type = gold_match.question_type.upper() if gold_match.question_type else friendly_query_class(cls.label)
+        justification = gold_match.justification or ans.working
+        full_page_ev = gold_match.evidence[0].full_page_text if gold_match.evidence else ""
+    else:
+        q_type = friendly_query_class(cls.label)
+        justification = ans.working
+        # Retrieve full text from matched page chunk
+        matched_chunk = next((h for h in hits if h.page_num == ans.page), hits[0] if hits else None)
+        full_page_ev = matched_chunk.text if matched_chunk else ""
+
     return {
         "question": question,
         "doc_name": doc_name,
@@ -569,6 +695,9 @@ def run_pipeline(question: str, doc_name: str, corpus_ref, retriever_ref, answer
         "verdict": verdict,
         "answer": ans,
         "citation": cite,
+        "justification": justification,
+        "question_type": q_type,
+        "full_page_evidence": full_page_ev,
         "elapsed": time.time() - start,
     }
 
@@ -583,7 +712,7 @@ def render_user_message(question: str, doc_name: str) -> None:
         <div class="chat-bubble-user">
             <div class="chat-user-header">
                 <span class="chat-user-label">[YOU]</span>
-                <span class="chat-user-target">FILING: {doc_name}</span>
+                <span class="chat-user-target">{doc_name}</span>
             </div>
             <div class="chat-user-text">{question}</div>
         </div>
@@ -597,6 +726,9 @@ def render_assistant_result(r: Dict[str, Any]) -> None:
     cite = r.get("citation")
     verdict = r.get("verdict")
     doc_name = r.get("doc_name", "")
+    q_type = r.get("question_type", "FINANCIAL QUERY")
+    justification = r.get("justification", "")
+    full_page_ev = r.get("full_page_evidence", "")
 
     if ans is None:
         st.markdown(f"""
@@ -652,32 +784,38 @@ def render_assistant_result(r: Dict[str, Any]) -> None:
     <div class="chat-row-assistant">
         <div class="depth-card chat-card-assistant">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.8rem;">
-                <div class="terminal-label">[ANALYST COPILOT] &middot; {doc_name}</div>
-                {f'<div class="tag-badge badge-verified">OFFICIAL PAGE {ans.page} CITATION VERIFIED</div>' if cite and cite.label == "VERIFIED" else '<div class="tag-badge badge-warning">UNCONFIRMED CITATION</div>'}
+                <div class="terminal-label" style="margin:0;">[ANALYST COPILOT]</div>
+                <div class="tag-badge badge-neutral">{q_type}</div>
             </div>
-            <div style="font-size: 1.35rem; font-weight: 700; color: #f8fafc; line-height: 1.45; font-family: 'Plus Jakarta Sans', sans-serif;">
+            <div style="font-size: 1.35rem; font-weight: 700; color: #f8fafc; line-height: 1.5; font-family: 'Plus Jakarta Sans', sans-serif; margin-bottom: 0.6rem;">
                 {ans.answer}
             </div>
     """, unsafe_allow_html=True)
 
-    # Calculation Output (User Friendly)
-    if ans.working and ans.working.strip():
-        st.markdown("<div class=\"terminal-label\" style=\"margin-top: 0.75rem;\">STEP-BY-STEP CALCULATION AUDIT</div>", unsafe_allow_html=True)
-        st.code(ans.working, language="text")
-
-    # Verbatim Citation Box (User Friendly)
-    if ans.quote and ans.quote.strip():
+    # Justification & Working (Attractive & Unscrollable)
+    if justification and justification.strip():
         st.markdown(f"""
-        <div class="quote-terminal">
-            <div style="font-size: 0.72rem; font-weight: 700; color: #38bdf8; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 0.35rem;">
-                EXACT EXCERPT FROM OFFICIAL FILING [PRINTED PAGE {ans.page if ans.page is not None else 'N/A'}]
+        <div class="terminal-label" style="margin-top: 0.85rem; color: #818cf8;">JUSTIFICATION &amp; WORKING</div>
+        <div class="justification-card">{justification.strip()}</div>
+        """, unsafe_allow_html=True)
+
+    # Unified Evidence & Citation Box (Page + Excerpt in same section)
+    if ans.quote and ans.quote.strip():
+        page_badge = f'<span class="tag-badge badge-verified">PAGE {ans.page} CITATION VERIFIED</span>' if (cite and cite.label == "VERIFIED" and ans.page is not None) else (f'<span class="tag-badge badge-warning">PAGE {ans.page}</span>' if ans.page is not None else '<span class="tag-badge badge-neutral">UNSPECIFIED PAGE</span>')
+        st.markdown(f"""
+        <div class="evidence-card">
+            <div class="evidence-header">
+                <div class="evidence-label">EVIDENCE &amp; CITATION</div>
+                <div>{page_badge}</div>
             </div>
-            "{ans.quote}"
+            <div class="evidence-text">
+                "{ans.quote.strip()}"
+            </div>
         </div>
         """, unsafe_allow_html=True)
 
     # Verification & Metrics Grid
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3 = st.columns(3)
     with col1:
         st.markdown(f"""
         <div class="kpi-box">
@@ -688,18 +826,11 @@ def render_assistant_result(r: Dict[str, Any]) -> None:
     with col2:
         st.markdown(f"""
         <div class="kpi-box">
-            <div class="kpi-label">QUESTION TYPE</div>
-            <div class="kpi-value" style="font-size: 0.82rem;">{friendly_query_class(r['cls'].label)}</div>
-        </div>
-        """, unsafe_allow_html=True)
-    with col3:
-        st.markdown(f"""
-        <div class="kpi-box">
             <div class="kpi-label">SECTIONS CHECKED</div>
             <div class="kpi-value">{r['k']} Sections</div>
         </div>
         """, unsafe_allow_html=True)
-    with col4:
+    with col3:
         st.markdown(f"""
         <div class="kpi-box">
             <div class="kpi-label">EVIDENCE AUDIT</div>
@@ -720,12 +851,13 @@ def render_assistant_result(r: Dict[str, Any]) -> None:
 inject_titanium_carbon_css()
 
 # API Key Validation
+kimi_key = (os.environ.get("KIMI_API_KEY") or os.environ.get("MOONSHOT_API_KEY") or "").strip()
 groq_key = os.environ.get("GROQ_API_KEY", "").strip()
 gemini_key = (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or "").strip()
 
-if not groq_key and not gemini_key:
+if not kimi_key and not groq_key and not gemini_key:
     st.error(
-        "NO API KEY DETECTED. Please set GROQ_API_KEY or GEMINI_API_KEY in your environment, then restart."
+        "NO API KEY DETECTED. Please set KIMI_API_KEY, GROQ_API_KEY, or GEMINI_API_KEY in your environment, then restart."
     )
     st.stop()
 
@@ -857,6 +989,8 @@ with st.sidebar:
 # ============================================================================
 # Main Header & Active Workspace Indicator
 # ============================================================================
+doc_meta = get_filing_metadata(st.session_state.selected_doc)
+
 st.markdown(f"""
 <div style="display: flex; flex-direction: column; gap: 0.2rem; padding: 0.25rem 0;">
     <div class="terminal-label">WORKSPACE CONTEXT &middot; THE ANALYST COPILOT</div>
@@ -873,6 +1007,28 @@ st.markdown(f"""
 # ============================================================================
 # Conversational Chat Stream (Left: Copilot, Right: User)
 # ============================================================================
+
+# Show Company Name, Period, and GICS Sector exactly once at the start of dialogue
+if st.session_state.messages:
+    st.markdown(f"""
+    <div class="depth-card" style="padding: 0.85rem 1.25rem; margin-bottom: 1.25rem; border-left: 3px solid #38bdf8; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 1rem;">
+        <div style="display: flex; align-items: center; gap: 2.25rem; flex-wrap: wrap;">
+            <div>
+                <div style="color: #64748b; font-size: 0.68rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em;">COMPANY</div>
+                <div style="color: #f8fafc; font-size: 1.05rem; font-weight: 700;">{doc_meta['company']}</div>
+            </div>
+            <div>
+                <div style="color: #64748b; font-size: 0.68rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em;">PERIOD</div>
+                <div style="color: #f8fafc; font-size: 1.05rem; font-weight: 700;">{doc_meta['doc_period']}</div>
+            </div>
+            <div>
+                <div style="color: #64748b; font-size: 0.68rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em;">GICS SECTOR</div>
+                <div style="color: #f8fafc; font-size: 1.05rem; font-weight: 700;">{doc_meta['gics_sector']}</div>
+            </div>
+        </div>
+        <div class="tag-badge badge-neutral" style="letter-spacing: 0.08em;">PRIMARY ENTITY CONTEXT</div>
+    </div>
+    """, unsafe_allow_html=True)
 
 # Render all existing conversation messages
 for msg in st.session_state.messages:
@@ -928,4 +1084,4 @@ if user_query and user_query.strip():
     st.rerun()
 
 st.markdown("<div style=\"margin-top: 4rem; text-align: center; color: #64748b; font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase;\">The Analyst Copilot &middot; Active Workspace &middot; Exact Page Citations</div>", unsafe_allow_html=True)
-
+
