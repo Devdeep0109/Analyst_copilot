@@ -78,10 +78,13 @@ class CitationCheck:
     match_ratio: float = 0.0
     found_on_page: int | None = None
     quote_len: int = 0
+    corrected_page: int | None = None
 
     @property
     def label(self) -> str:
-        return "VERIFIED" if self.passed else "REJECTED"
+        if self.passed:
+            return "VERIFIED" if self.corrected_page is None else "VERIFIED*"
+        return "REJECTED"
 
 
 def check_citation(
@@ -167,6 +170,17 @@ def check_citation(
     # Where did it actually come from? Useful for diagnosis: a quote that is
     # real but attributed to the wrong page is a different failure from one
     # that was invented.
+    # AUTO-CORRECT rather than reject.
+    #
+    # If the quote is verbatim on a DIFFERENT retrieved page, the evidence is
+    # genuine and only the label is wrong. The model writes the page as text in
+    # its JSON -- it reads "--- PAGE 51 ---", quotes that block, and sometimes
+    # writes 63. chunk.page_num was right the whole time; the model's copy of
+    # it was not.
+    #
+    # Rejecting outright scored 0. But we have just PROVEN which page the text
+    # is on, so we can cite that page instead and earn the full mark. Trusting
+    # verified text over an unverified label is strictly more correct.
     elsewhere = None
     for c in chunks:
         if c.page_num == page:
@@ -175,8 +189,11 @@ def check_citation(
             elsewhere = c.page_num
             break
     if elsewhere is not None:
-        return CitationCheck(False, f"quote is real but on page {elsewhere}, not {page}",
-                             best, elsewhere, len(q_tokens))
+        return CitationCheck(True,
+                             f"quote verified on page {elsewhere} "
+                             f"(model said {page}) -- citation corrected",
+                             1.0, elsewhere, len(q_tokens),
+                             corrected_page=elsewhere)
 
     return CitationCheck(False, f"quote not found on page {page} "
                                 f"(best overlap {best:.0%})",

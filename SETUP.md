@@ -110,9 +110,55 @@ to disk after that, so it's a one-off cost.
 
 ---
 
-## Note on my sandbox vs your machine
+## 6. The frontend (Streamlit app)
 
-I can read and write files in this folder, but I run Python in a separate Linux
-sandbox with no PyPI access — so I can't install these packages or download
-models myself. BM25 and dense retrieval get **written** here by me and **run**
-by you. Paste the output back and we'll compare the ladder honestly.
+`app.py` is a browser UI over the exact same pipeline `eval/run_pipeline.py`
+runs from the CLI: retrieve → Verifier #1 (sufficiency gate) → answer →
+Verifier #2 (citation check).
+
+```powershell
+pip install -r requirements.txt        # now includes streamlit + watchdog
+$env:GROQ_API_KEY = 'gsk_...'           # same key the CLI uses
+streamlit run app.py
+```
+
+It opens at http://localhost:8501.
+
+Notes:
+
+- **It needs the data pack** (`data/filings/*.htm`, `data/practice-questions.jsonl`)
+  and an LLM key (`GROQ_API_KEY`, or `GEMINI_API_KEY`) in the shell you launch
+  `streamlit` from — set them *before* `streamlit run`, not in the browser.
+- **First query is slow.** Loading a filing triggers the MiniLM embedding
+  download + that filing's embeddings, plus the ~90 MB cross-encoder reranker.
+  Everything caches to `.cache/` afterwards; later questions are fast.
+- **Launch from the activated venv.** If `where streamlit` (PowerShell) points
+  outside `.venv\Scripts\`, it's the wrong interpreter and imports like
+  `sentence-transformers` will fail — `.\.venv\Scripts\Activate.ps1` first.
+- **Adding filings from the UI:** the sidebar has an uploader that accepts SEC
+  filings as inline-XBRL `.htm` (as downloaded from EDGAR). It writes to
+  `data/filings/` and parses on the spot; PDFs and plain HTML won't parse.
+
+---
+
+## Troubleshooting
+
+**`GROQ_API_KEY is not set`** — set it in the shell you are running from, not a
+different one. `[Environment]::SetEnvironmentVariable(...,'User')` only affects
+terminals opened afterwards.
+
+**`HTTP 403: error code 1010`** — Cloudflare rejecting the client, not a bad key.
+The HTTP client sends a proper User-Agent to avoid this; if you see it, check you
+are on the current `pipeline/llm.py`.
+
+**`Groq quota exhausted -- wait NNNNs`** — the daily token cap, not per-minute
+throttling. Everything is cached, so re-running after the reset resumes where it
+stopped rather than starting over.
+
+**Rate-limited mid-run** — raise `--rate` (seconds between calls). Counter-
+intuitively this is *faster* than being throttled, because a 429 costs a full
+retry ladder and still fails.
+
+**`sentence-transformers` import errors** — you are on the wrong interpreter.
+Activate the venv first; check with `where streamlit` (PowerShell) or
+`which streamlit`.

@@ -78,22 +78,82 @@ Rules:
 6. Put the actual expression in "working", e.g. "177866/135987-1 = 0.308 =
    30.8%". Re-check that "answer" equals what it evaluates to. Watch the scale:
    a ratio near 0.01 is not 7.2 -- confirm the magnitude is plausible.
-7. ANSWER BY DEFAULT. Your best supported answer is far more useful than a
-   refusal. Give your best reading of the figures even if you are not certain,
-   as long as the numbers are on the page.
-   Use answer=null ONLY when a required figure is genuinely absent -- the
-   question asks FY2019 and only FY2021 appears, or the line item is nowhere in
-   any excerpt. Do NOT return null because:
+7. FIND A QUOTE BEFORE YOU DECIDE. Search every excerpt for the most relevant
+   line, write it into "quote", and only then judge whether you can answer.
+   If you have a relevant quote, you have evidence -- use it.
+   answer=null is for one case only: you searched and found NO relevant quote.
+   It is NOT for:
      - the calculation takes several steps
      - the filing words it differently from the question
      - you would prefer more surrounding context
      - you are merely unsure
-   If a figure is on the page and it plausibly answers the question, answer.
-8. Use the units the question asks for.
+   An answer you flag as approximate is more useful than a refusal.
+8. YES/NO QUESTIONS ("Does X have...", "Is X...", "Did X report...", "Has X...")
+   can almost always be decided from the figures present. Answer yes or no, and
+   quote the line you based it on.
+9. Use the units the question asks for.
+
+FILL THE FIELDS IN THIS ORDER. Find the evidence BEFORE deciding whether you can
+answer -- write "quote" and "page" first, then "working", and only then "answer".
+
+JSON only, keys in this exact order:
+{{"quote":"<verbatim text from an excerpt>","page":<the PAGE number>,"working":"<expression, or empty>","answer":"<answer or null>"}}
+"""
+
+
+# SECOND PASS for questions the model declined.
+#
+# Four prompt rewrites failed to move the abstention rate (38.6% -> 28.6%, and
+# the last three changes moved it by ~1 point between them). But 26 of the 36
+# declines HAD the evidence in front of them, and at a conversion rate of 0.685
+# each is worth about +0.37 in expectation -- roughly +10 points left on the
+# table.
+#
+# So instead of arguing with the model in the first prompt, ask again with the
+# escape hatch removed. There is no `null` in this schema. The safety net is
+# unchanged: Verifier #1 and Verifier #2 still gate whatever comes back, and a
+# forced answer that cannot be cited is caught exactly as any other would be.
+RETRY_PROMPT = """\
+You previously declined this question. The excerpts below DO contain relevant
+figures. Give your best answer using them.
+
+Q: {question}
+
+{evidence}
+
+Rules:
+1. You MUST answer. Estimate from the figures present rather than declining.
+2. "quote" = text copied CHARACTER-FOR-CHARACTER from one excerpt.
+3. "page" = the number in the `--- PAGE n ---` header above the text you quoted.
+4. Synonyms: "Net sales"=revenue. "Purchases of property, plant and equipment
+   (PP&E)"=capex. "Property, plant and equipment - net"=net PP&E/PPNE.
+5. If the exact figure is missing, use the closest relevant one and say what you
+   assumed in "working". A stated approximation beats a refusal.
+6. For yes/no questions, decide yes or no from the figures and cite the line.
 
 JSON only:
-{{"answer":"<answer or null>","quote":"<verbatim>","page":<the PAGE number>,"working":"<expression>"}}
+{{"quote":"<verbatim>","page":<the PAGE number>,"working":"<expression or assumption>","answer":"<your best answer>"}}
 """
+
+
+import re as _re
+
+# A refusal announced at the START of the answer. Anchored on purpose -- see
+# Answer.abstained. "Not meaningful", "Insufficient data", "Cannot be
+# calculated" are declines; a sentence that mentions "not available" halfway
+# through is usually a real answer with a caveat.
+_REFUSAL_RE = _re.compile(
+    r"^\s*(insufficient\b"
+    r"|not\s+(calculable|determinable|available|provided|disclosed|possible|"
+    r"enough)\b"
+    r"|cannot\s+be\s+(calculated|determined|computed|answered)\b"
+    r"|unable\s+to\b"
+    r"|no\s+(data|information|figures?)\s+(is\s+)?(available|provided|given)\b"
+    r"|the\s+(filing|excerpts?|document)\s+does\s+not\s+"
+    r"(provide|contain|disclose|state)\b"
+    r")",
+    _re.I,
+)
 
 
 @dataclass
@@ -105,16 +165,37 @@ class Answer:
     raw: str = ""
     cached: bool = False
     failed: bool = False
+    retried: bool = False   # produced by the second, forced pass
 
     @property
     def abstained(self) -> bool:
-        return self.answer is None or not str(self.answer).strip() \
-            or str(self.answer).strip().lower() in {"null", "none", "n/a", "not found"}
+        """Did the model decline -- in ANY form?
+
+        It does not only return null. It also refuses in prose:
+            "Insufficient data to calculate the FY2019 cash conversion cycle"
+            "Not calculable - the filing does not provide cost of goods sold"
+            "Conventional inventory turnover cannot be calculated from ..."
+        Those are honest refusals worth 0, but they were being scored as
+        CONFIDENTLY WRONG (-1) because the field was non-empty. Each one cost a
+        point it should not have.
+
+        The pattern is deliberately anchored to the START of the answer. A
+        refusal announces itself up front; a real answer that happens to
+        mention "not available" later ("Revenue was $5m; the segment split is
+        not available") is a genuine answer and must not be caught.
+        """
+        raw = str(self.answer or "").strip()
+        if not raw or raw.lower() in {"null", "none", "n/a", "not found",
+                                      "not available", "unknown"}:
+            return True
+        return bool(_REFUSAL_RE.match(raw))
 
 
 class Answerer:
     def __init__(self, client=None, max_chars: int = 1000,
-                 use_cache: bool = True, total_budget: int | None = None):
+                 use_cache: bool = True, total_budget: int | None = None,
+                 retry_on_abstain: bool = False):
+        self.retry_on_abstain = retry_on_abstain
         self.client = client or get_client()
         self.max_chars = max_chars
         self.total_budget = total_budget
@@ -147,8 +228,42 @@ class Answerer:
         self._cache_path().write_text(json.dumps(self._cache), encoding="utf-8")
         self._dirty = False
 
-    def _key(self, question: str, evidence: str) -> str:
-        return hashlib.md5(f"{PROMPT}||{question}||{evidence}".encode()).hexdigest()
+    def _key(self, question: str, evidence: str, prompt: str = PROMPT) -> str:
+        return hashlib.md5(f"{prompt}||{question}||{evidence}".encode()).hexdigest()
+
+    def _ask(self, prompt_template: str, question: str, evidence: str,
+             retried: bool) -> Answer:
+        """One LLM call against a given prompt template."""
+        try:
+            resp = self.client.complete_json(
+                prompt_template.format(question=question, evidence=evidence),
+                system=SYSTEM, max_tokens=900)
+        except Exception as e:
+            self.n_errors += 1
+            return Answer(None, f"llm error: {str(e)[:120]}", failed=True,
+                          retried=retried)
+
+        self.n_calls += 1
+        data = resp.json()
+        if data is None:
+            self.n_errors += 1
+            return Answer(None, "unparseable answer", raw=resp.text,
+                          failed=True, retried=retried)
+
+        page = data.get("page")
+        try:
+            page = int(page) if page is not None else None
+        except (TypeError, ValueError):
+            page = None
+
+        return Answer(
+            answer=data.get("answer"),
+            quote=str(data.get("quote", ""))[:1500],
+            page=page,
+            working=str(data.get("working", ""))[:500],
+            raw=resp.text,
+            retried=retried,
+        )
 
     def answer(self, question: str, chunks: list[Chunk]) -> Answer:
         if not chunks:
@@ -158,43 +273,49 @@ class Answerer:
                                    total_budget=self.total_budget)
         key = self._key(question, evidence)
 
+        a = None
         if self.use_cache:
             self._load()
             if key in self._cache:
                 d = self._cache[key]
-                return Answer(d.get("answer"), d.get("quote", ""), d.get("page"),
-                              d.get("working", ""), cached=True)
+                a = Answer(d.get("answer"), d.get("quote", ""), d.get("page"),
+                           d.get("working", ""), cached=True,
+                           retried=d.get("retried", False))
+                # A cached ABSTAIN is still eligible for the retry pass, so a
+                # first run and a later --retry run compose rather than the
+                # cache locking in the refusal.
+                if not (self.retry_on_abstain and a.abstained):
+                    return a
 
-        try:
-            resp = self.client.complete_json(
-                PROMPT.format(question=question, evidence=evidence),
-                system=SYSTEM, max_tokens=900)
-        except Exception as e:
-            self.n_errors += 1
-            # An API failure must abstain, never guess. 0 beats -1.
-            return Answer(None, f"llm error: {str(e)[:120]}", failed=True)
+        # Only pay for the first call if we have not already got one cached.
+        # Without this guard, --retry-abstain re-ran the FIRST prompt for every
+        # cached abstention as well as the retry -- two calls where one was
+        # needed, and 36 of them silently.
+        if a is None:
+            a = self._ask(PROMPT, question, evidence, retried=False)
 
-        self.n_calls += 1
-        data = resp.json()
-        if data is None:
-            self.n_errors += 1
-            return Answer(None, "unparseable answer", raw=resp.text, failed=True)
+        # SECOND PASS. Only fires on a genuine refusal -- never on an API error
+        # (retrying a dead quota just burns two calls instead of one).
+        if self.retry_on_abstain and a.abstained and not a.failed:
+            rkey = self._key(question, evidence, RETRY_PROMPT)
+            if self.use_cache and rkey in self._cache:
+                d = self._cache[rkey]
+                a = Answer(d.get("answer"), d.get("quote", ""), d.get("page"),
+                           d.get("working", ""), cached=True, retried=True)
+            else:
+                forced = self._ask(RETRY_PROMPT, question, evidence, retried=True)
+                if not forced.failed and not forced.abstained:
+                    if self.use_cache:
+                        self._cache[rkey] = {
+                            "answer": forced.answer, "quote": forced.quote,
+                            "page": forced.page, "working": forced.working,
+                            "retried": True}
+                        self._dirty = True
+                    a = forced
 
-        page = data.get("page")
-        try:
-            page = int(page) if page is not None else None
-        except (TypeError, ValueError):
-            page = None
-
-        a = Answer(
-            answer=data.get("answer"),
-            quote=str(data.get("quote", ""))[:1500],
-            page=page,
-            working=str(data.get("working", ""))[:500],
-            raw=resp.text,
-        )
-        if self.use_cache:
+        if self.use_cache and not a.retried:
             self._cache[key] = {"answer": a.answer, "quote": a.quote,
-                                "page": a.page, "working": a.working}
+                                "page": a.page, "working": a.working,
+                                "retried": False}
             self._dirty = True
         return a

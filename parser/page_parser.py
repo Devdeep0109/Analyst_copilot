@@ -82,9 +82,33 @@ class ParsedTable:
 
 @dataclass
 class Page:
-    page_num: int          # 1-indexed, in OUR parser's counting
+    """TWO page numbers, because two different consumers need two conventions.
+
+    page_num      sequential position in the document, 1-indexed. This is the
+                  PDF sheet number, and it is what FinanceBench's
+                  `evidence_page_num` refers to (0-based, hence the +1 in
+                  eval/gold.py). EVALUATION SCORES AGAINST THIS.
+
+    printed_page  the number actually printed at the foot of the page. A 10-K
+                  puts ~14 pages of cover and table of contents before printed
+                  page 1, so sheet 60 is commonly printed "46". THE UI SHOWS
+                  THIS, because it is what an analyst turns to.
+
+    Collapsing these into one field forces a choice between a correct product
+    and a correct score. Keeping both means calibration can improve what the
+    user sees without silently making every cited page count as "wrong
+    location" against the answer key.
+    """
+    page_num: int
     text: str               # plain text of the page (tables rendered as grids)
     tables: list[ParsedTable] = field(default_factory=list)
+    printed_page: int | None = None
+
+    @property
+    def display_page(self) -> int:
+        """What to show a human. Falls back to the sheet number when the
+        filing's own numbering could not be determined."""
+        return self.printed_page if self.printed_page is not None else self.page_num
 
     def contains(self, snippet: str) -> bool:
         return _normalize(snippet) in _normalize(self.text)
@@ -234,8 +258,124 @@ def parse_filing(html_path: str, doc_name: str | None = None) -> ParsedFiling:
         pages.append(Page(page_num=page_num, text=_join_parts(buf_parts), tables=seg_tables))
 
     has_page_breaks = raw_break_count > 0
+
+    if has_page_breaks:
+        _calibrate_page_nums(pages)
+
     return ParsedFiling(doc_name=doc_name, pages=pages,
                          has_page_breaks=has_page_breaks, raw_break_count=raw_break_count)
+
+
+# ------------- TOC-based page-number calibration ----------------------------
+
+# Each tuple: (regex matching "Section Title  NN" in the TOC, substring to
+# search for in the body page).  These section titles appear in virtually every
+# SEC 10-K/10-Q and are distinctive enough to land on only one body page.
+_TOC_ANCHORS = [
+    (re.compile(r"Legal Proceedings\s+(\d+)"),
+     "Legal Proceedings"),
+    (re.compile(r"Risk Factors\s+(\d+)"),
+     "Risk Factors"),
+    (re.compile(r"Controls and Procedures\s+(\d+)"),
+     "Controls and Procedures"),
+    (re.compile(r"Unregistered Sales\s+(\d+)"),
+     "Unregistered Sales"),
+    (re.compile(r"Mine Safety Disclosures\s+(\d+)"),
+     "Mine Safety Disclosures"),
+    (re.compile(r"Quantitative and Qualitative Disclosures\s+(\d+)"),
+     "Quantitative and Qualitative Disclosures"),
+    (re.compile(r"Unresolved Staff Comments\s+(\d+)"),
+     "Unresolved Staff Comments"),
+    (re.compile(r"Properties\s+(\d+)"),
+     "Properties"),
+]
+
+
+def _calibrate_page_nums(pages: list[Page]) -> None:
+    """Detect the offset between raw parser page numbers and the filing's own
+    numbering (as printed in its Table of Contents), and shift all page numbers
+    so they match the filing's convention.
+
+    Strategy: find the TOC page(s), extract section→page mappings using known
+    anchor patterns, locate those same sections in the body, and compute the
+    dominant offset.
+    """
+    if len(pages) < 4:
+        return  # too few pages to calibrate
+
+    # 1. Find TOC page(s) — always in the first ~8 pages.
+    toc_text = ""
+    toc_page_nums: set[int] = set()
+    for p in pages[:8]:
+        if "TABLE OF CONTENTS" in p.text.upper():
+            toc_text += " " + p.text
+            toc_page_nums.add(p.page_num)
+
+    if not toc_text:
+        return  # no TOC found — cannot calibrate
+
+    # 2. Cross-reference: for each TOC anchor, find the stated page, then
+    #    locate that section title in body pages and record the offset.
+    offsets: list[int] = []
+    for pat, label in _TOC_ANCHORS:
+        m = pat.search(toc_text)
+        if not m:
+            continue
+        toc_stated_page = int(m.group(1))
+        label_lower = label.lower()
+        for p in pages:
+            if p.page_num in toc_page_nums:
+                continue  # skip the TOC page itself
+            # Check near top of page (first 600 chars) case-insensitively
+            if label_lower in p.text[:600].lower():
+                offsets.append(p.page_num - toc_stated_page)
+                break
+
+    if not offsets:
+        return
+
+    # 3. Take the dominant offset.
+    from collections import Counter
+    counts = Counter(offsets)
+    dominant_offset, support = counts.most_common(1)[0]
+
+    # ---- SANITY CHECKS -------------------------------------------------
+    # Without these, one bad TOC match silently corrupts every page number in
+    # the filing. 3M_2023Q2_10Q produced a shift of +45 -- the anchor matched
+    # the wrong section, and every page the UI showed for that document was
+    # wrong. A calibration you cannot trust is worse than none, because it is
+    # invisible.
+
+    # (a) A NEGATIVE offset means the body page came BEFORE the page the TOC
+    #     says it is on. That is impossible in a real document; it means the
+    #     anchor matched a mention in the TOC region or a cross-reference.
+    if dominant_offset < 0:
+        return
+
+    # (b) Front matter is a cover page, a TOC, maybe a forward-looking
+    #     statement. More than 25 pages of it is not front matter, it is a
+    #     mismatch.
+    if dominant_offset > 25:
+        return
+
+    # (c) One anchor agreeing with itself is not evidence. Require either two
+    #     anchors agreeing, or a single anchor with no competing answer.
+    if support < 2 and len(counts) > 1:
+        return
+
+    if dominant_offset == 0:
+        for p in pages:
+            p.printed_page = p.page_num
+        return
+
+    # 4. RECORD the printed number. Do NOT overwrite page_num -- that is the
+    #    sheet index the evaluation scores against.
+    for p in pages:
+        printed = p.page_num - dominant_offset
+        # Front matter has no printed number (or uses roman numerals we do not
+        # parse). Leave it None so display_page falls back to the sheet number
+        # rather than showing a fabricated "1" for the first fifteen pages.
+        p.printed_page = printed if printed >= 1 else None
 
 
 def _join_parts(parts: list[str]) -> str:

@@ -27,3 +27,11 @@ sentence-transformers>=3.0
 # --- Day 4: reranking (install when you get there, not before) ---
 # The cross-encoder reranker uses the same sentence-transformers package,
 # so there is nothing extra to install for it.
+
+# --- frontend: the Streamlit app (app.py) ---
+# `streamlit run app.py` gives a browser UI over the same pipeline that
+# eval/run_pipeline.py runs from the CLI. Nothing new for the pipeline itself;
+# this is only the UI layer. watchdog is optional -- Streamlit uses it for
+# faster file-watching and prints a hint if it's missing.
+streamlit>=1.31
+watchdog>=4.0                 # optional; faster reload, silences a startup hint
